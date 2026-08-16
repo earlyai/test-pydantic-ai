@@ -1,3 +1,9 @@
+> [!NOTE]
+> This EarlyAI repository supports a historical regression case file. See the
+> [Pydantic AI streaming regression replay](REGRESSION-REPLAY.md) for the
+> Early-generated investigation prompt, reproduction script, expected results,
+> technical explanation, and sources.
+
 <div align="center">
   <a href="https://ai.pydantic.dev/">
     <picture>
