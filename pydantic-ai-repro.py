@@ -11,6 +11,7 @@ Exit code 0 means the behavior passed. Exit code 1 means it failed.
 
 import asyncio
 import sys
+import warnings
 
 import pydantic_ai
 from pydantic_ai import Agent
@@ -28,7 +29,14 @@ async def partial_handler(ctx, stream):
 def get_usage(result):
     """Support Pydantic AI versions where usage is a method or a property."""
     attr = result.usage
-    return attr() if callable(attr) else attr
+    if callable(attr):
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message=r'`AgentRunResult\.usage` is no longer a method.*',
+            )
+            return attr()
+    return attr
 
 
 async def main():
@@ -61,16 +69,10 @@ async def main():
         baseline_usage.output_tokens,
     )
     if same_output and same_usage:
-        print(
-            f'RESULT: PASS version={version} '
-            '(output and usage identical with and without handler)'
-        )
+        print(f'RESULT: PASS version={version} (output and usage identical with and without handler)')
         sys.exit(0)
 
-    print(
-        f'RESULT: FAIL version={version} mode=silent '
-        f'(output_equal={same_output} usage_equal={same_usage})'
-    )
+    print(f'RESULT: FAIL version={version} mode=silent (output_equal={same_output} usage_equal={same_usage})')
     sys.exit(1)
 
 
