@@ -43,13 +43,12 @@ except ImportError as _import_error:  # pragma: no cover
     ) from _import_error
 
 if TYPE_CHECKING:
-    import httpx
-
     # Only needed for typing: the provider supplies the concrete client at runtime, so importing the
     # protocol helpers below (e.g. from the xAI realtime provider) doesn't require the `openai` package.
     from openai import AsyncOpenAI
     from openai.types.realtime.realtime_truncation_param import RealtimeTruncationParam
 
+from .._http import AsyncHTTPClient
 from .._instrumentation import get_instructions
 from ..exceptions import UserError
 from ..messages import (
@@ -84,6 +83,7 @@ from ._openai_protocol import (
     RealtimeHandshakeError,
     SemanticVAD,
     ServerVAD,
+    config_interrupts_response_on_speech,
     connect_openai_protocol,
     expect_event,
     loads_obj,
@@ -113,6 +113,7 @@ from .codec import (
     RealtimeConnection,
     RealtimeInput,
     SessionUsage,
+    TextContext,
     ToolResult,
     TruncateOutput,
 )
@@ -358,11 +359,13 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         dial: Callable[[], Awaitable[ClientConnection]] | None = None,
         reconnect: ReconnectPolicy | None = None,
         input_transcription_enabled: bool = True,
+        interrupts_response_on_speech: bool = False,
         model_name: str | None = None,
         model_name_getter: Callable[[], str | None] | None = None,
         observes_output_audio: bool = True,
     ) -> None:
         self._ws = ws
+        self._interrupts_response_on_speech = interrupts_response_on_speech
         self._model_name = model_name
         self._model_name_getter = model_name_getter
         # `dial` re-establishes a fully configured connection; with a `reconnect` policy it is used to
@@ -431,11 +434,15 @@ class OpenAIRealtimeConnection(RealtimeConnection):
     def input_transcription_enabled(self) -> bool:
         return self._input_transcription_enabled
 
+    @property
+    def interrupts_response_on_speech(self) -> bool:
+        return self._interrupts_response_on_speech
+
     async def send(self, content: RealtimeInput) -> None:
         """Send content to the OpenAI Realtime API.
 
-        Accepts `BinaryAudio` (raw PCM16, 24kHz, mono), a `str` text turn, `BinaryImage`,
-        `ToolResult`, and the control verbs `CommitAudio`, `ClearAudio`, `CreateResponse`,
+        Accepts `BinaryAudio` (raw PCM16, 24kHz, mono), a `str` text turn, `TextContext` (text added
+        without soliciting a reply), `BinaryImage`, `ToolResult`, and the control verbs `CommitAudio`, `ClearAudio`, `CreateResponse`,
         `CancelResponse`, and `TruncateOutput`.
         """
         if isinstance(content, BinaryAudio):
@@ -446,18 +453,9 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                     'audio': base64.b64encode(content.data).decode('ascii'),
                 }
             )
-        elif isinstance(content, str):
-            await self._send_event(
-                {
-                    'type': CONVERSATION_ITEM_CREATE_EVENT,
-                    'item': {
-                        'type': 'message',
-                        'role': 'user',
-                        'content': [{'type': 'input_text', 'text': content}],
-                    },
-                }
-            )
-            await self._request_response()
+        elif isinstance(content, (str, TextContext)):
+            text = content if isinstance(content, str) else content.text
+            await self._send_text(text, respond=isinstance(content, str))
         elif isinstance(content, ToolResult):
             # Normalize any follow-up content (downloading and re-encoding media) before the first
             # frame goes out, so content this provider can't carry fails with nothing sent rather than
@@ -540,6 +538,20 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                 )
         else:
             raise UserError(f'{self._provider_label} does not support {type(content).__name__} input.')
+
+    async def _send_text(self, text: str, *, respond: bool) -> None:
+        await self._send_event(
+            {
+                'type': CONVERSATION_ITEM_CREATE_EVENT,
+                'item': {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [{'type': 'input_text', 'text': text}],
+                },
+            }
+        )
+        if respond:
+            await self._request_response()
 
     async def _request_response(self) -> None:
         """Ask the model to respond now, or defer until the active response completes."""
@@ -923,9 +935,8 @@ class OpenAIRealtimeModel(RealtimeModel):
         settings: RealtimeModelSettings | None = None,
         profile: RealtimeModelProfileSpec | None = None,
     ) -> None:
+        super().__init__(settings=settings, profile=profile)
         self.model = model
-        self.settings = settings
-        self._profile = profile
         self._provider = self._resolve_provider(provider)
 
     @staticmethod
@@ -1050,7 +1061,7 @@ class OpenAIRealtimeModel(RealtimeModel):
         return self._webrtc_url('realtime/client_secrets')
 
     @property
-    def _http_client(self) -> httpx.AsyncClient:
+    def _http_client(self) -> AsyncHTTPClient:
         return self._provider.client._client  # pyright: ignore[reportPrivateUsage]
 
     async def _webrtc_headers(self) -> dict[str, str]:
@@ -1247,6 +1258,7 @@ class OpenAIRealtimeModel(RealtimeModel):
                 dial=dial,
                 reconnect=settings.get('reconnect'),
                 input_transcription_enabled=transcription_enabled,
+                interrupts_response_on_speech=config_interrupts_response_on_speech(session_config),
                 model_name=server_model,
                 model_name_getter=model_name_getter,
             )

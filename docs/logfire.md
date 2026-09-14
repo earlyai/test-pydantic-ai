@@ -114,7 +114,7 @@ We can also query data with SQL in Logfire to monitor the performance of an appl
 As per Hamel Husain's influential 2024 blog post ["Fuck You, Show Me The Prompt."](https://hamel.dev/blog/posts/prompt/)
 (bear with the capitalization, the point is valid), it's often useful to be able to view the raw HTTP requests and responses made to model providers.
 
-To observe raw HTTP requests made to model providers, you can use Logfire's [HTTPX instrumentation](https://logfire.pydantic.dev/docs/integrations/http-clients/httpx/) since all provider SDKs (except for [Bedrock](models/bedrock.md)) use the [HTTPX](https://www.python-httpx.org/) library internally:
+To observe raw HTTP requests made to model providers, you can use Logfire's [HTTPX instrumentation](https://logfire.pydantic.dev/docs/integrations/http-clients/httpx/). Provider SDKs use either `httpx` or [`httpx2`](https://httpx2.pydantic.dev/) internally, except for [Bedrock](models/bedrock.md), which uses boto3:
 
 
 ```py {title="with_logfire_instrument_httpx.py" hl_lines="7"}
@@ -132,7 +132,9 @@ print(result.output)
 #> The capital of France is Paris.
 ```
 
-1. See the [`logfire.instrument_httpx` docs][logfire.Logfire.instrument_httpx] more details, `capture_all=True` means both headers and body are captured for both the request and response.
+1. See the [`logfire.instrument_httpx` docs][logfire.Logfire.instrument_httpx] for more details. `capture_all=True` means both headers and body are captured for both the request and response.
+
+    `httpx2` instrumentation requires `opentelemetry-instrumentation-httpx>=0.65b0`, which the [`logfire` extra](install.md#slim-install) installs for you. If you pin OpenTelemetry yourself and end up below that version, `logfire.instrument_httpx()` reports the missing requirement and emits no `httpx2` spans.
 
 ![Logfire with HTTPX instrumentation](img/logfire-with-httpx.png)
 
@@ -144,7 +146,7 @@ This means you can debug and monitor Pydantic AI with any OpenTelemetry backend.
 
 Pydantic AI follows the [OpenTelemetry Semantic Conventions for Generative AI systems](https://opentelemetry.io/docs/specs/semconv/gen-ai/), so while we think you'll have the best experience using the Logfire platform :wink:, you should be able to use any OTel service with GenAI support.
 
-### Logfire with an alternative OTel backend
+### Logfire with an alternative OTel backend {#otel}
 
 You can use the Logfire SDK completely freely and send the data to any OpenTelemetry backend.
 
@@ -295,6 +297,8 @@ Pydantic AI follows the [OpenTelemetry Semantic Conventions for Generative AI sy
 
 Versions 2, 3, and 4 are deprecated compatibility formats. Passing one of these versions to [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] emits a [`PydanticAIDeprecationWarning`][pydantic_ai.agent.PydanticAIDeprecationWarning]; use version 5 unless you are temporarily preserving an older telemetry pipeline.
 
+Version 6 is opt-in: it changes the role of messages you already receive, so pass it explicitly once your telemetry consumer is ready for the new role.
+
 #### Version 2 (deprecated)
 
 Uses the newer OpenTelemetry GenAI spec and stores messages in the following attributes:
@@ -339,6 +343,15 @@ Builds on version 4 with improved handling of deferred tool calls:
 
 - [`CallDeferred`][pydantic_ai.exceptions.CallDeferred] and [`ApprovalRequired`][pydantic_ai.exceptions.ApprovalRequired] exceptions no longer record an exception event or set the span status to ERROR — the span is left as UNSET, since deferrals are control flow, not errors.
 
+#### Version 6 (opt-in)
+
+Builds on version 5 by giving tool results the message role the [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/gen-ai-input-messages.json) pair with the `tool_call_response` parts they carry:
+
+- Old (v2-5): a tool result is a `tool_call_response` part inside a `{"role": "user"}` message
+- New (v6): it moves to a `{"role": "tool"}` message
+
+This applies to tool returns and to retries that answer a tool call. A retry that answers nothing — output validation, a `ModelRetry` from a validator — stays on `user`, which is the role it reaches the model as. A request whose parts span both roles is emitted as consecutive messages in part order rather than one merged message.
+
 ---
 
 Note that the OpenTelemetry Semantic Conventions are still experimental and are likely to change.
@@ -364,7 +377,7 @@ Agent.instrument_all(instrumentation_settings)
 
 ### Excluding binary content
 
-When `include_binary_content=False` is set, binary file data (images, audio, documents) is excluded from telemetry: from user prompts and model responses, from tool returns, from the agent's own output and the arguments its output function receives, and from run and tool deferral metadata. The media type is still recorded everywhere; where the value is recorded as the file itself rather than as a message part, so are its vendor metadata and its identifier, which is derived from the content when you don't set one.
+When `include_binary_content=False`, Pydantic AI excludes binary file data, including images, audio, and documents, from telemetry for user prompts, model responses, tool returns, the agent's output, output-function arguments, and run and tool deferral metadata. The media type remains recorded everywhere. When a value is recorded as a file rather than a message part, its vendor metadata and identifier are recorded too; Pydantic AI derives the identifier from the content when you do not set one.
 
 Binary content is found inside dictionaries, lists and [`ToolReturn`][pydantic_ai.messages.ToolReturn]s, but not inside your own types: a [`BinaryContent`][pydantic_ai.messages.BinaryContent] held as a field of a model or dataclass you define is still recorded in full.
 
@@ -422,3 +435,9 @@ The `gen_ai.tool.definitions` attribute (tool name, description, and parameters)
 Use the agent's `metadata` parameter to attach additional data to the agent's span.
 When instrumentation is enabled, the computed metadata is recorded on the agent span under the `metadata` attribute.
 See the [usage and metadata example in the agents guide](agent.md#run-metadata) for details and usage.
+
+### The first-run banner
+
+Until instrumentation is configured, the first agent run in a process prints a short banner to `stderr` describing the run and pointing here. It's shown only where someone is there to read it: when `stderr` is a terminal, or when a coding agent is running the process and reads back what it writes. It's never shown when instrumentation is configured, under `pytest`, or when `CI` is set to any value. To turn it off entirely, set `PYDANTIC_AI_NO_BANNER` to any value in the environment, or set `pydantic_ai.BANNER_ENABLED = False` before the first agent run.
+
+Coding agents are recognized by the environment variables they set for the purpose. That list is best-effort and will always be behind, so a harness it doesn't recognize — including one built on Pydantic AI — can set `AI_AGENT` (or `AGENT`) to be treated the same way, naming itself in the value.

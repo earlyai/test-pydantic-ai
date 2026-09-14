@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
-from httpx import Timeout
 from typing_extensions import TypedDict
+
+from ._http import legacy_httpx
+
+if TYPE_CHECKING:
+    from httpx import Timeout
+else:
+    # Legacy HTTPX is optional: without it no `Timeout` instance can reach `ModelSettings`, so the
+    # union member collapses onto the numeric one it already allows.
+    Timeout = legacy_httpx.Timeout if legacy_httpx is not None else float
 
 ThinkingEffort: TypeAlias = Literal['minimal', 'low', 'medium', 'high', 'xhigh']
 """The string effort levels for thinking/reasoning configuration."""
@@ -122,6 +130,7 @@ class ModelSettings(TypedDict, total=False):
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -151,6 +160,8 @@ class ModelSettings(TypedDict, total=False):
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot (not sent for the Anthropic models that reject sampling settings, e.g.
+      `claude-opus-4.8`)
     * Ollama
     * OpenRouter
     * Snowflake
@@ -178,6 +189,8 @@ class ModelSettings(TypedDict, total=False):
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot (not sent for the Anthropic models that reject sampling settings, e.g.
+      `claude-opus-4.8`)
     * Ollama
     * OpenRouter
     * Snowflake
@@ -201,15 +214,21 @@ class ModelSettings(TypedDict, total=False):
     timeout: int | float | Timeout
     """Override the client-level default timeout for a request, in seconds.
 
+    Numeric seconds work everywhere. A legacy `httpx.Timeout` is also accepted and is converted to an
+    `httpx2.Timeout` on the paths whose SDK expects one. `httpx2.Timeout` is deliberately not part of
+    this contract, because some SDKs behind these settings still reject it.
+
     Supported by:
 
     * OpenAI
+    * OpenAI Codex
     * Anthropic
     * Google (numeric seconds only, not `httpx.Timeout`)
     * Groq
     * Mistral (numeric seconds only, not `httpx.Timeout`)
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -223,11 +242,14 @@ class ModelSettings(TypedDict, total=False):
     Supported by:
 
     * OpenAI (some models, not o1)
+    * OpenAI Codex
     * Anthropic
     * Groq
     * Mistral
     * xAI
+    * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -270,6 +292,7 @@ class ModelSettings(TypedDict, total=False):
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama (sent, but Ollama documents `tool_choice` as unsupported)
     * OpenRouter
     * Snowflake
@@ -291,6 +314,7 @@ class ModelSettings(TypedDict, total=False):
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -310,7 +334,9 @@ class ModelSettings(TypedDict, total=False):
     * Mistral
     * xAI
     * HuggingFace
+    * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -330,7 +356,9 @@ class ModelSettings(TypedDict, total=False):
     * Mistral
     * xAI
     * HuggingFace
+    * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -347,6 +375,7 @@ class ModelSettings(TypedDict, total=False):
     * Groq
     * HuggingFace
     * Crusoe
+    * GitHub Copilot
     * Ollama (sent, but Ollama documents `logit_bias` as unsupported)
     * OpenRouter
     * Snowflake
@@ -371,6 +400,7 @@ class ModelSettings(TypedDict, total=False):
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -384,12 +414,14 @@ class ModelSettings(TypedDict, total=False):
     Supported by:
 
     * OpenAI
+    * OpenAI Codex
     * Anthropic
     * Google
     * Groq
     * Bedrock
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake
@@ -427,6 +459,8 @@ class ModelSettings(TypedDict, total=False):
     * Cerebras (only `False` is forwarded, as `reasoning_effort='none'`; the enable levels are not
       sent because Cerebras models reason by default, and `gpt-oss` ignores the disable too)
     * Crusoe
+    * GitHub Copilot (as `reasoning_effort`; which ids accept it, and which levels, is per-model and
+      enforced by Copilot, so an unsupported value comes back as a `400 invalid_reasoning_effort`)
     * Ollama
     * OpenRouter (as `extra_body['reasoning']`)
     * Snowflake (as `extra_body['reasoning']` on Claude models, otherwise as `reasoning_effort`)
@@ -446,10 +480,14 @@ class ModelSettings(TypedDict, total=False):
     Supported by:
 
     * OpenAI
+    * OpenAI Codex
     * Anthropic
     * Google (Gemini API and Google Cloud)
     * Bedrock
+    * Cerebras (sent and enum-validated — HTTP 200 on an ordinary key; the tiers are in private
+      preview, so no effect is observable without access)
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake (sent, but Snowflake Cortex rejects `service_tier` with an error)
@@ -466,11 +504,13 @@ class ModelSettings(TypedDict, total=False):
     Supported by:
 
     * OpenAI
+    * OpenAI Codex
     * Anthropic
     * Groq
     * HuggingFace
     * Cerebras
     * Crusoe
+    * GitHub Copilot
     * Ollama
     * OpenRouter
     * Snowflake

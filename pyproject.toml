@@ -49,7 +49,7 @@ requires-python = ">=3.10"
 
 [tool.hatch.metadata.hooks.uv-dynamic-versioning]
 dependencies = [
-    "pydantic-ai-slim[openai,anthropic,google,cli,mcp,evals,web,retries,logfire]=={{ version }}",
+    "pydantic-ai-slim[openai,anthropic,google,cli,mcp,evals,web,logfire]=={{ version }}",
 ]
 
 [tool.hatch.metadata.hooks.uv-dynamic-versioning.optional-dependencies]
@@ -76,6 +76,7 @@ duckduckgo = ["pydantic-ai-slim[duckduckgo]=={{ version }}"]
 tavily = ["pydantic-ai-slim[tavily]=={{ version }}"]
 exa = ["pydantic-ai-slim[exa]=={{ version }}"]
 web-fetch = ["pydantic-ai-slim[web-fetch]=={{ version }}"]
+retries = ["pydantic-ai-slim[retries]=={{ version }}"]
 temporal = ["pydantic-ai-slim[temporal]=={{ version }}"]
 spec = ["pydantic-ai-slim[spec]=={{ version }}"]
 mcp-tasks = ["pydantic-ai-slim[mcp-tasks]=={{ version }}"]
@@ -85,13 +86,13 @@ google-realtime = ["pydantic-ai-slim[google-realtime]=={{ version }}"]
 xai-realtime = ["pydantic-ai-slim[xai-realtime]=={{ version }}"]
 
 [project.urls]
-Homepage = "https://ai.pydantic.dev"
+Homepage = "https://pydantic.dev/docs/ai/"
 Source = "https://github.com/pydantic/pydantic-ai"
-Documentation = "https://ai.pydantic.dev"
+Documentation = "https://pydantic.dev/docs/ai/"
 Changelog = "https://github.com/pydantic/pydantic-ai/releases"
 
 [project.scripts]
-pai = "pydantic_ai._cli:cli_exit" # TODO remove this when clai has been out for a while
+pai = "pydantic_ai._cli:cli_exit" # TODO(v3): remove this alias; clai has been on PyPI since 2025-05. https://pypi.org/project/clai/#history
 
 [tool.uv.sources]
 pydantic-ai = { workspace = true }
@@ -173,12 +174,9 @@ build-constraint-dependencies = [
 ]
 
 [tool.uv.exclude-newer-package]
-# Test-only, and the wire types it carries are the reference the MCP SDK v1/v2 compat readers are
-# checked against — released 2026-07-28, days inside the rolling window. Drop this line once the
-# window has moved past it. Timezone-explicit because uv resolves a bare date in the local
-# timezone, which would make `uv lock --check` machine-dependent.
-mcp-types = "2026-07-30T00:00:00Z"
 # These are our own packages, not worth defending from supply chain attacks on them.
+# `listentome` is maintained by a Pydantic team member and counts as one of ours.
+listentome = false
 pydantic = false
 pydantic-core = false
 pydantic-extra-types = false
@@ -187,11 +185,20 @@ pydantic-handlebars = false
 genai-prices = false
 logfire = false
 logfire-api = false
+# Anthropic 1.3.0 is the first release listing `claude-fable-5-1` and `claude-mythos-5-1`.
+# TODO(dsfaccini): Remove after 2026-09-08 17:37 UTC. https://github.com/pydantic/pydantic-ai/issues/7985
+# This admits only the reviewed 1.3.0 artifacts; later Anthropic artifacts remain quarantined.
+anthropic = "2026-09-01T17:37:11Z"
+# OpenAI 3.8.0 is the first release listing `gpt-6-astra` in `ChatModel`/`ReasoningEffort('max')`.
+# TODO(dsfaccini): Remove after 2026-09-10 19:51 UTC.
+openai = "2026-09-03T19:51:09Z"
 
 [dependency-groups]
 dev = [
     "anyio>=4.7.0",
+    "trio>=0.34.0",
     "asgi-lifespan>=2.1.0",
+    "httpx>=0.27",
     "devtools>=0.12.2",
     "coverage[toml]>=7.10.7",
     "dirty-equals>=0.9.0",
@@ -206,14 +213,17 @@ dev = [
     "pytest-mock>=3.14.0",
     "pytest-pretty>=1.3.0",
     "pytest-recording>=0.13.2",
-    "diff-cover>=9.2.0",
     "boto3-stubs[bedrock-runtime]>=1.42.63",
-    "strict-no-cover @ git+https://github.com/pydantic/strict-no-cover.git@7fc59da2c4dff919db2095a0f0e47101b657131d",
     "pytest-xdist>=3.6.1",
     # Needed for PyCharm users
     "pip>=26.1",
     "genai-prices>=0.1.0",
     "brotli>=1.2.0",
+    # `tests/durable_exec/test_dbos.py`'s fixture sets `enable_otlp=True` to cover DBOS's OTLP integration, and
+    # dbos's own `config_logger` imports this unconditionally on that path without requiring its
+    # `[otel]` extra (only a real bug for callers who set `enable_otlp=True` without it — most don't,
+    # so the public `dbos` extra doesn't need this): https://github.com/dbos-inc/dbos-transact-py/issues/832
+    "opentelemetry-instrumentation-logging>=0.63b0",
     # Tests use `FastMCP(...)` in-process servers via fastmcp's server module — the user-facing
     # `[mcp]` extra ships `fastmcp-slim[client]` which lacks server support, so devs need the full
     # `fastmcp` package alongside, tracking the same range as the `[mcp]` extra (#6661).
@@ -224,7 +234,22 @@ dev = [
     # BlockBuster minor releases may add breaking detection rules; keep this test detector on 1.5.x.
     "blockbuster>=1.5.26,<1.6",
 ]
-lint = ["mypy>=1.11.2", "pyright>=1.1.408", "ruff>=0.14.14"]
+# `strict-no-cover` is only invoked by the final coverage audit, which runs on a GitHub-hosted
+# runner. Keeping it out of `dev` means the test matrix -- twenty cells of which run on Ubicloud --
+# never fetches a Git dependency during setup, so GitHub's per-IP unauthenticated clone limit
+# cannot take the matrix down.
+coverage = [
+    # Pinned at the in-process rework, which reads `Coverage._get_file_reporter` -- a private API --
+    # and so declares `coverage>=7,<8`. A future coverage 8.x bump would be blocked on this
+    # dependency until upstream reworks it off that API.
+    "strict-no-cover @ git+https://github.com/pydantic/strict-no-cover.git@6c644106e03138abae01d8d60105d4a7ad4916a1",
+]
+lint = [
+    "griffecli>=2.1.0,<3",
+    "mypy>=1.11.2",
+    "pyright>=1.1.408",
+    "ruff>=0.14.14",
+]
 [tool.hatch.build.targets.wheel]
 bypass-selection = true
 exclude = ["/pydantic_ai_slim/pydantic_ai/.agents"]
@@ -246,16 +271,29 @@ include = [
     "clai/**/*.py",
     "tests/**/*.py",
     "docs/**/*.py",
+    "scripts/typecheck_changed.py",
+    "scripts/test_typecheck_changed.py",
     ".github/scripts/ci_duration.py",
+    ".github/scripts/check_api_compatibility.py",
     ".github/scripts/test_ci_duration.py",
+    ".github/scripts/test_check_api_compatibility.py",
     ".github/scripts/pydantic_ai_gh_aw_shim/**/*.py",
     ".github/scripts/test_pydantic_ai_runner.py",
     ".github/scripts/issue_pr_attention_monitor.py",
     ".github/scripts/test_issue_pr_attention_monitor.py",
+    ".github/scripts/semantic_owner_router.py",
+    ".github/scripts/test_semantic_owner_router.py",
+    ".github/scripts/community_demand.py",
+    ".github/scripts/test_community_demand.py",
+    ".github/scripts/triage_telemetry.py",
+    ".github/scripts/test_triage_telemetry.py",
+    ".github/scripts/feature_digest.py",
+    ".github/scripts/test_feature_digest.py",
     ".github/scripts/agentic_workflow_guard.py",
     ".github/scripts/test_agentic_workflow_guard.py",
     ".github/scripts/agent_spend_report.py",
     ".github/scripts/test_agent_spend_report.py",
+    ".github/scripts/test_docs_navigation_workflow.py",
     ".github/scripts/test_protect_github_dir.py",
 ]
 
@@ -308,12 +346,20 @@ quote-style = "single"
 "tests/**/*.py" = ["D"]
 "docs/**/*.py" = ["D"]
 ".github/scripts/ci_duration.py" = ["D"]
+".github/scripts/check_api_compatibility.py" = ["D"]
 ".github/scripts/test_ci_duration.py" = ["D"]
+".github/scripts/test_check_api_compatibility.py" = ["D"]
 ".github/scripts/test_pydantic_ai_runner.py" = ["D"]
 ".github/scripts/test_issue_pr_attention_monitor.py" = ["D"]
+".github/scripts/test_semantic_owner_router.py" = ["D"]
+".github/scripts/test_community_demand.py" = ["D"]
+".github/scripts/test_triage_telemetry.py" = ["D"]
+".github/scripts/test_feature_digest.py" = ["D"]
 ".github/scripts/test_agentic_workflow_guard.py" = ["D"]
 ".github/scripts/test_agent_spend_report.py" = ["D"]
+".github/scripts/test_docs_navigation_workflow.py" = ["D"]
 ".github/scripts/test_protect_github_dir.py" = ["D"]
+"scripts/test_typecheck_changed.py" = ["D"]
 
 [tool.pyright]
 pythonVersion = "3.10"
@@ -329,11 +375,19 @@ include = [
     "tests",
     "examples",
     "clai",
+    "scripts/typecheck_changed.py",
+    "scripts/test_typecheck_changed.py",
     ".github/scripts/ci_duration.py",
+    ".github/scripts/check_api_compatibility.py",
     ".github/scripts/test_ci_duration.py",
+    ".github/scripts/test_check_api_compatibility.py",
     ".github/scripts/pydantic_ai_gh_aw_shim",
     ".github/scripts/test_pydantic_ai_runner.py",
     ".github/scripts/issue_pr_attention_monitor.py",
+    ".github/scripts/semantic_owner_router.py",
+    ".github/scripts/community_demand.py",
+    ".github/scripts/triage_telemetry.py",
+    ".github/scripts/feature_digest.py",
 ]
 # The monitor policy tests deliberately exercise private helpers and loose GitHub
 # webhook dictionaries through monkeypatching; pytest covers them, while the
@@ -348,11 +402,16 @@ executionEnvironments = [
     # the test file, not under the project root) the same way the runtime
     # `sys.path.insert(...)` at the top of the test does.
     { root = ".github/scripts/test_ci_duration.py", extraPaths = [".github/scripts"], reportUnusedFunction = false, reportPrivateImportUsage = false },
+    { root = ".github/scripts/test_check_api_compatibility.py", extraPaths = [".github/scripts"], reportUnusedFunction = false, reportPrivateImportUsage = false },
     { root = ".github/scripts/test_pydantic_ai_runner.py", extraPaths = [".github/scripts"], reportUnusedFunction = false, reportPrivateImportUsage = false },
+    # `scripts/typecheck_changed.py` reads `tomllib`, which is 3.11+. These two are
+    # developer tooling rather than shipped code, and the script falls back to the full
+    # type check on an older interpreter, so they are analysed above the library's floor.
+    { root = "scripts/typecheck_changed.py", pythonVersion = "3.11" },
+    { root = "scripts/test_typecheck_changed.py", extraPaths = ["scripts"], pythonVersion = "3.11", reportUnusedFunction = false, reportPrivateImportUsage = false },
 ]
 exclude = [
     "examples/pydantic_ai_examples/weather_agent_gradio.py",
-    "examples/pydantic_ai_examples/realtime_voice.py",       # optional, untyped `sounddevice` audio dep
     "pydantic_ai_slim/pydantic_ai/embeddings/voyageai.py",   # voyageai package has no type stubs
 ]
 
@@ -383,7 +442,13 @@ filterwarnings = [
     "ignore: 'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:cohere",
     # This is because of google.
     "ignore: '_UnionGenericAlias' is deprecated and slated for removal:DeprecationWarning:google.genai",
+    # DBOS logs through the `LoggingHandler` that OpenTelemetry SDK 1.40 deprecated, reached whenever
+    # `enable_otlp` is set as `tests/durable_exec/test_dbos.py` does.
+    # TODO(v3): Require `dbos>=2.31.0` and drop this filter.
+    # https://github.com/dbos-inc/dbos-transact-py/pull/822
+    "ignore:`LoggingHandler` in `opentelemetry-sdk` is deprecated:DeprecationWarning:opentelemetry.sdk._logs",
     # TODO(Marcelo): Drop this once voyageai stops using Pydantic V1 functionality.
+    # Fixed upstream in 0.4.0: https://github.com/voyage-ai/voyageai-python/pull/60 — drop when we bump past 0.3.7.
     "ignore: Core Pydantic V1 functionality:UserWarning",
     # prefect has a Pydantic v2 compatibility issue in RRuleSchedule
     "ignore:UnsupportedFieldAttributeWarning:UserWarning",
@@ -399,6 +464,12 @@ filterwarnings = [
     # logfire to use logging.warning() instead of warnings.warn() for this diagnostic — it's
     # informational, not a deprecation, and should never be able to crash execution.
     "ignore:Found propagated trace context:RuntimeWarning",
+    # `starlette.testclient` still references the `anyio.abc.BlockingPortal` alias that anyio 4.15.0
+    # deprecated, so the warning fires at import time and fails collection of every test module that
+    # imports it. There is nothing to bump to: starlette's `master` still uses the alias.
+    # TODO: Drop once starlette moves to `anyio.from_thread.BlockingPortal`.
+    # https://github.com/Kludex/starlette/issues/3497
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
 ]
 
 # https://coverage.readthedocs.io/en/latest/config.html#run
@@ -457,7 +528,7 @@ exclude_lines = [
     '@deprecated',
     '@typing.overload',
     '@abstractmethod',
-    '\(Protocol\):$',
+    '\(Protocol\b.*\):$',
     'typing.assert_never',
     '$\s*assert_never\(',
     'if __name__ == .__main__.:',

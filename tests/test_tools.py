@@ -1,12 +1,13 @@
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import pydantic_core
 import pytest
-from pydantic import AliasChoices, BaseModel, Field, TypeAdapter, WithJsonSchema
+from pydantic import AliasChoices, BaseModel, Field, TypeAdapter, ValidationError, WithJsonSchema
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import PydanticSerializationError, core_schema
 from pytest import LogCaptureFixture
@@ -117,6 +118,24 @@ def test_tool_ctx_second():
     assert str(exc_info.value) == snapshot(
         """\
 Error generating schema for test_tool_ctx_second.<locals>.invalid_tool:
+  First parameter of tools that take context must be annotated with RunContext[...]
+  RunContext annotations can only be used as the first argument\
+"""
+    )
+
+
+def test_tool_ctx_last():
+    agent = Agent(TestModel())
+
+    with pytest.raises(UserError) as exc_info:
+
+        @agent.tool  # pyright: ignore[reportArgumentType]
+        def invalid_tool(first: int, last: str, ctx: RunContext) -> str:  # pragma: no cover
+            return f'{first} {last}'
+
+    assert str(exc_info.value) == snapshot(
+        """\
+Error generating schema for test_tool_ctx_last.<locals>.invalid_tool:
   First parameter of tools that take context must be annotated with RunContext[...]
   RunContext annotations can only be used as the first argument\
 """
@@ -1382,6 +1401,25 @@ def test_sync_prepare_tools_agent_wide():
     assert result.output == snapshot('{"foobar":"0"}')
 
 
+def test_tool_explicit_empty_description_suppresses_docstring():
+    """https://github.com/pydantic/pydantic-ai/issues/7670"""
+
+    def my_tool(x: int) -> int:
+        """Docstring that should not be sent to the model."""
+        return x
+
+    assert Tool(my_tool).tool_def.description == 'Docstring that should not be sent to the model.'
+    assert Tool(my_tool, description=None).tool_def.description == 'Docstring that should not be sent to the model.'
+    assert Tool(my_tool, description='').tool_def.description == ''
+    assert Tool(my_tool, description=' ').tool_def.description == ' '
+
+    test_model = TestModel()
+    agent = Agent(test_model, tools=[Tool(my_tool, description='')])
+    agent.run_sync('hello')
+    assert test_model.last_model_request_parameters is not None
+    assert test_model.last_model_request_parameters.function_tools[0].description == ''
+
+
 def test_function_tool_consistent_with_schema():
     def function(*args: Any, **kwargs: Any) -> str:
         assert len(args) == 0
@@ -1726,6 +1764,40 @@ def test_tool_raises_approval_required():
         ]
     )
     assert result.output == snapshot('Done!')
+
+
+@pytest.mark.parametrize('approval', [None, 'yes'])
+def test_invalid_deferred_tool_approval_does_not_execute(approval: object):
+    """Not a VCR test: invalid approval values are application inputs, not provider responses."""
+    executed = False
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart('my_tool', {}, tool_call_id='call-1')])
+        return ModelResponse(parts=[TextPart('Done!')])  # pragma: no cover
+
+    agent = Agent(FunctionModel(llm), output_type=[str, DeferredToolRequests])
+
+    @agent.tool_plain(requires_approval=True)
+    def my_tool() -> str:  # pragma: no cover
+        nonlocal executed
+        executed = True
+        return 'executed'
+
+    result = agent.run_sync('Run the tool')
+    assert isinstance(result.output, DeferredToolRequests)
+    invalid_approval = cast(bool | ToolApproved | ToolDenied, approval)  # Simulate invalid runtime input.
+
+    with pytest.raises(
+        UserError,
+        match="Invalid approval result for tool call 'call-1': expected `bool`, `ToolApproved`, or `ToolDenied`",
+    ):
+        agent.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=DeferredToolResults(approvals={'call-1': invalid_approval}),
+        )
+
+    assert not executed
 
 
 @pytest.mark.parametrize('end_strategy', ['early', 'graceful', 'exhaustive'])
@@ -2868,6 +2940,11 @@ def test_deferred_tool_results_serializable():
     )
 
 
+def test_deferred_tool_results_does_not_coerce_approval():
+    with pytest.raises(ValidationError):
+        TypeAdapter(DeferredToolResults).validate_python({'approvals': {'call-1': 'yes'}})
+
+
 def test_deferred_tool_call_result_tool_failed():
     """A `ToolFailed` in `DeferredToolResults.calls` reaches the model as a failed tool return, not a retry or a success."""
 
@@ -3105,6 +3182,38 @@ async def test_tool_timeout_triggers_retry():
     assert len(retry_parts) == 1
     assert 'Timed out after 0.1 seconds' in retry_parts[0].content
     assert retry_parts[0].tool_name == 'slow_tool'
+
+
+@pytest.mark.anyio
+async def test_sync_tool_timeout_triggers_retry():
+    """A blocking `def` tool times out too: its worker thread is abandoned when the deadline expires."""
+    call_count = 0
+
+    async def model_logic(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name='slow_sync_tool', args={}, tool_call_id='call-1')])
+        return ModelResponse(parts=[TextPart(content='Tool timed out, giving up')])
+
+    agent = Agent(FunctionModel(model_logic))
+
+    @agent.tool_plain(timeout=0.01)
+    def slow_sync_tool() -> str:
+        time.sleep(0.1)
+        # The abandoned thread runs to completion, so this line is covered; only its result is discarded.
+        return 'done'
+
+    result = await agent.run('call slow_sync_tool')
+
+    retry_parts = [
+        part
+        for part in iter_message_parts(result.all_messages(), ModelRequest, RetryPromptPart)
+        if 'Timed out' in str(part.content)
+    ]
+    assert len(retry_parts) == 1
+    assert 'Timed out after 0.01 seconds' in retry_parts[0].content
+    assert retry_parts[0].tool_name == 'slow_sync_tool'
 
 
 @pytest.mark.anyio
@@ -4749,10 +4858,10 @@ def test_return_schema_self_unbound():
 
     from typing_extensions import Self
 
-    from pydantic_ai._function_schema import _extract_return_schema_type
+    from pydantic_ai._function_schema import extract_return_schema_type
 
     # Pass Self directly as the annotation — no need for a real function with Self return
-    result = _extract_return_schema_type(Self, lambda: None)
+    result = extract_return_schema_type(Self, lambda: None)
     assert result is Any
 
 

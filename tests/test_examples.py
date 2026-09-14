@@ -18,6 +18,8 @@ import httpx
 import pytest
 from _pytest.mark import ParameterSet
 from devtools import debug
+from genai_prices import UpdatePrices
+from genai_prices.data_snapshot import get_snapshot
 from pytest_examples import CodeExample, EvalExample, find_examples
 from pytest_examples.config import ExamplesConfig as BaseExamplesConfig
 from pytest_mock import MockerFixture
@@ -35,6 +37,7 @@ from pydantic_ai import (
     NativeToolReturnPart,
     RetryPromptPart,
     TextPart,
+    ToolAvailabilityDeltaPart,
     ToolCallPart,
     ToolReturnPart,
     ToolsetTool,
@@ -45,6 +48,8 @@ from pydantic_ai._utils import group_by_temporal
 from pydantic_ai.embeddings import EmbeddingModel, infer_embedding_model
 from pydantic_ai.embeddings.test import TestEmbeddingModel
 from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.images import ImageGenerationModel, infer_image_generation_model
+from pydantic_ai.images.test import TestImageGenerationModel
 from pydantic_ai.models import KnownModelName, Model, ModelRequestParameters, infer_model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
@@ -105,8 +110,15 @@ def find_filter_examples() -> Iterable[ParameterSet]:
     root_dir = Path(__file__).parent.parent
     os.chdir(root_dir)
 
-    for ex in find_examples('docs', 'pydantic_ai_slim', 'pydantic_graph', 'pydantic_evals'):
+    for ex in find_examples('README.md', 'docs', 'pydantic_ai_slim', 'pydantic_graph', 'pydantic_evals'):
         if '.agents' in ex.path.parts:
+            continue
+        if ex.path.name == 'README.md' and (
+            'pydantic_ai_harness' in ex.source or 'agent.realtime(' in ex.source or 'ClearToolResults(' in ex.source
+        ):
+            # README fences stay bare so GitHub renders them; snippets that can't run here
+            # (harness imports, the Coder blocks-equivalence fragment, interactive realtime
+            # sessions) are excluded by content instead.
             continue
         if ex.path.name != '_utils.py':
             try:
@@ -232,6 +244,7 @@ def test_docs_examples(
 ):
     mocker.patch('pydantic_ai.agent.models.infer_model', side_effect=mock_infer_model)
     mocker.patch('pydantic_ai.embeddings.infer_embedding_model', side_effect=mock_infer_embedding_model)
+    mocker.patch('pydantic_ai.images.infer_image_generation_model', side_effect=mock_infer_image_generation_model)
     mocker.patch('pydantic_ai._utils.group_by_temporal', side_effect=mock_group_by_temporal)
     mocker.patch('pydantic_evals.reporting.render_numbers._render_duration', side_effect=mock_render_duration)
 
@@ -239,6 +252,11 @@ def test_docs_examples(
     mocker.patch('httpx.Client.post', side_effect=http_request)
     mocker.patch('httpx.AsyncClient.get', side_effect=async_http_request)
     mocker.patch('httpx.AsyncClient.post', side_effect=async_http_request)
+    mocker.patch('httpx2.Client.get', side_effect=http_request)
+    mocker.patch('httpx2.Client.post', side_effect=http_request)
+    mocker.patch('httpx2.AsyncClient.get', side_effect=async_http_request)
+    mocker.patch('httpx2.AsyncClient.post', side_effect=async_http_request)
+    mocker.patch.object(UpdatePrices, 'fetch', return_value=get_snapshot())
     mocker.patch('random.randint', return_value=4)
     mocker.patch('rich.prompt.Prompt.ask', side_effect=rich_prompt_ask)
 
@@ -283,11 +301,13 @@ def test_docs_examples(
     env.set('TOGETHER_API_KEY', 'testing')
     env.set('OLLAMA_API_KEY', 'testing')
     env.set('OLLAMA_BASE_URL', 'http://localhost:11434/v1')
+    env.set('VLLM_BASE_URL', 'http://localhost:8000/v1')
     env.set('AZURE_OPENAI_API_KEY', 'testing')
     env.set('AZURE_OPENAI_ENDPOINT', 'https://your-azure-endpoint.openai.azure.com')
     env.set('OPENAI_API_VERSION', '2024-05-01')
     env.set('OPENROUTER_API_KEY', 'testing')
     env.set('GITHUB_API_KEY', 'testing')
+    env.set('GITHUB_COPILOT_API_KEY', 'testing')
     env.set('GROK_API_KEY', 'testing')
     env.set('MOONSHOTAI_API_KEY', 'testing')
     env.set('DEEPSEEK_API_KEY', 'testing')
@@ -304,6 +324,15 @@ def test_docs_examples(
     env.set('ZAI_API_KEY', 'testing')
     env.set('SNOWFLAKE_ACCOUNT', 'myorg-myaccount')
     env.set('SNOWFLAKE_TOKEN', 'testing')
+
+    # The Codex provider reads the Codex CLI's `auth.json` (honoring `CODEX_HOME`) instead of an
+    # env var, so fake the file the same way the API keys above are faked.
+    codex_home = tmp_path_cwd / 'codex-home'
+    codex_home.mkdir(exist_ok=True)
+    (codex_home / 'auth.json').write_text(
+        json.dumps({'tokens': {'access_token': 'testing', 'refresh_token': 'testing', 'account_id': 'testing'}})
+    )
+    env.set('CODEX_HOME', str(codex_home))
 
     prefix_settings = example.prefix_settings()
     opt_test = prefix_settings.get('test', '')
@@ -440,7 +469,7 @@ class MockMCPServer(AbstractToolset[Any]):
 
     @property
     def id(self) -> str | None:
-        return None  # pragma: no cover
+        return None
 
     async def get_instructions(self, ctx: RunContext[Any]) -> str | None:
         return None
@@ -523,6 +552,9 @@ text_responses: dict[str, str | ToolCallPart | Sequence[ToolCallPart]] = {
         'The first known use of "hello, world" was in a 1974 textbook about the C programming language.'
     ),
     'What is my balance?': ToolCallPart(tool_name='customer_balance', args={'include_pending': True}),
+    'Was I refunded for the duplicate charge on my last statement?': ToolCallPart(
+        tool_name='load_capability', args={'id': 'refunds'}
+    ),
     'I just lost my card!': ToolCallPart(
         tool_name='final_result',
         args={
@@ -700,14 +732,15 @@ text_responses: dict[str, str | ToolCallPart | Sequence[ToolCallPart]] = {
         args={'name': 'test', 'value': 42},
         tool_call_id='pyd_ai_tool_call_id',
     ),
+    'How are people feeling about the Extract app?': ToolCallPart(
+        tool_name='recent_reviews',
+        args={'product': 'Extract'},
+    ),
     'Find recent papers about transformer architectures': (
         'Here are some recent papers about transformer architectures from arxiv.org:\n'
         '\n'
         '1. "Attention Is All You Need" - The foundational paper on the Transformer model.\n'
         '2. "FlashAttention: Fast and Memory-Efficient Exact Attention" - Proposes an IO-aware attention algorithm.'
-    ),
-    'What was the mass of the largest meteorite found this year?': (
-        'The largest meteorite recovered this year weighed approximately 7.6 kg, found in the Sahara Desert in January.'
     ),
     'Write a long essay about Python': (
         'Python is a versatile, high-level programming language known for its readability and simplicity. '
@@ -924,6 +957,12 @@ async def model_logic(  # noqa: C901
                     FilePart(content=BinaryImage(data=b'fake', media_type='image/png', identifier='160d47')),
                 ]
             )
+        elif m.content == 'Generate a minimalist logo for a coffee shop called Extract.':
+            return ModelResponse(
+                parts=[
+                    FilePart(content=BinaryImage(data=b'fake', media_type='image/png', identifier='160d47')),
+                ]
+            )
         elif m.content == 'Generate a wide illustration of an axolotl city skyline.':
             return ModelResponse(
                 parts=[
@@ -1016,6 +1055,29 @@ async def model_logic(  # noqa: C901
     elif isinstance(m, ToolReturnPart) and m.tool_name == 'customer_balance':
         args = {
             'support_advice': 'Hello John, your current account balance, including pending transactions, is $123.45.',
+            'block_card': False,
+            'risk': 1,
+        }
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name='final_result', args=args, tool_call_id='pyd_ai_tool_call_id')]
+        )
+    elif isinstance(m, ToolAvailabilityDeltaPart) and 'refund_status' in m.tools_added:
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name='refund_status', args={}, tool_call_id='pyd_ai_tool_call_id')]
+        )
+    elif isinstance(m, ToolReturnPart) and m.tool_name == 'recent_reviews':
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='final_result',
+                    args={'label': 'positive', 'score': 0.9},
+                    tool_call_id='pyd_ai_tool_call_id',
+                )
+            ]
+        )
+    elif isinstance(m, ToolReturnPart) and m.tool_name == 'refund_status':
+        args = {
+            'support_advice': 'Good news, John: the duplicate charge on your last statement was refunded on 2026-05-01.',
             'block_card': False,
             'risk': 1,
         }
@@ -1246,6 +1308,15 @@ def mock_infer_embedding_model(model: EmbeddingModel | str) -> EmbeddingModel:
     }
     dimensions = dimensions_map.get(model_name, 8)
     return TestEmbeddingModel(model_name, provider_name=provider_name, dimensions=dimensions)
+
+
+def mock_infer_image_generation_model(model: ImageGenerationModel | str) -> ImageGenerationModel:
+    """Mock image generation model inference while validating the provider and model name."""
+    if isinstance(model, ImageGenerationModel):
+        return model
+
+    actual_model = infer_image_generation_model(model)
+    return TestImageGenerationModel(actual_model.model_name, provider_name=actual_model.system)
 
 
 def mock_infer_model(model: Model | KnownModelName) -> Model:

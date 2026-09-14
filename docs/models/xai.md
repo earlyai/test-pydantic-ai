@@ -110,6 +110,36 @@ agent = Agent(model)
 ...
 ```
 
+## Image generation
+
+Use [`ImageGenerator`][pydantic_ai.images.ImageGenerator] with an `xai:` image model for direct generation and
+reference-image editing through the official xAI SDK:
+
+```python {title="xai_image_generation.py"}
+from pydantic_ai import ImageGenerator
+from pydantic_ai.images.xai import XaiImageGenerationSettings
+
+generator = ImageGenerator(
+    'xai:grok-imagine-image',
+    settings=XaiImageGenerationSettings(aspect_ratio='16:9', xai_resolution='1k'),
+)
+```
+
+xAI accepts inline or remote reference images and xAI Files API IDs represented as
+[`UploadedFile`][pydantic_ai.messages.UploadedFile]. Mixed reference inputs must not require the SDK to reorder the
+sequence. See the [image-generation guide](../image-generation.md) for the common API and geometry behavior.
+
+### Moderated images
+
+xAI moderates silently: when it flags an image, the request still succeeds and the flagged slot comes back empty rather
+than as an error. Pydantic AI returns the images that were not flagged, so one flagged image doesn't discard the rest of
+a batch you were charged for, and reports the flagged positions in `provider_details['moderated_image_indices']`.
+
+That key holds the zero-based positions in the batch that xAI flagged, and is only present when at least one image was
+flagged, so `len(result.images)` plus the number of flagged positions equals the `xai_n` you requested. A
+[`ContentFilterError`][pydantic_ai.exceptions.ContentFilterError] is raised only when every image was flagged, since
+then there is no result to return.
+
 ## X Search
 
 xAI models support searching X (formerly Twitter) for real-time posts and content. The recommended way to enable it is with the [`XSearch`][pydantic_ai.capabilities.XSearch] capability — see the [capability documentation](../capabilities/overview.md#provider-adaptive-tools) for more details, including cross-provider usage. For the full list of supported options, see the [xAI X Search documentation](https://docs.x.ai/developers/tools/x-search).
@@ -152,6 +182,14 @@ The `XSearch` capability accepts:
 - **`include_output`** (default: `False`): include the raw X search results on the [`NativeToolReturnPart`][pydantic_ai.messages.NativeToolReturnPart] available via [`ModelResponse.native_tool_calls`][pydantic_ai.messages.ModelResponse.native_tool_calls]. Without this, the model uses the search results internally but only returns its text summary; enabling it gives programmatic access to the searched posts, sources, and metadata.
 
 As an alternative to the capability, you can pass the lower-level [`XSearchTool`][pydantic_ai.native_tools.XSearchTool] directly via `capabilities=[NativeTool(XSearchTool(...))]` — see the [X Search Tool documentation](../native-tools.md#x-search-tool) — or enable raw output globally via the [`XaiModelSettings.xai_include_x_search_output`][pydantic_ai.models.xai.XaiModelSettings.xai_include_x_search_output] [model setting](../agent.md#model-run-settings).
+
+## File attachments
+
+When you include a document in a user prompt, xAI automatically makes its `attachment_search` tool available on [supported agentic models](https://docs.x.ai/developers/files). If the model uses the tool, Pydantic AI exposes its lifecycle alongside the model's response. xAI limits each file to [48 MB](https://docs.x.ai/developers/files#limitations). See [document input](../input.md#document-input) for supported input forms.
+
+The [`NativeToolCallPart`][pydantic_ai.messages.NativeToolCallPart] and [`NativeToolReturnPart`][pydantic_ai.messages.NativeToolReturnPart] have a `tool_name` of `'attachment_search'`, and the call's `provider_details['function_name']` holds xAI's own name for the operation it ran (for example `'pdf_browse'`). Set [`XaiModelSettings.xai_include_attachment_search_output`][pydantic_ai.models.xai.XaiModelSettings.xai_include_attachment_search_output] to `True` to ask xAI to include the browsed content on the [`NativeToolReturnPart`][pydantic_ai.messages.NativeToolReturnPart]. It defaults to `False`, so the option is not sent unless you enable it.
+
+Attachment search applies to files attached directly to a conversation. To search persistent xAI collections instead, use [`FileSearchTool`][pydantic_ai.native_tools.FileSearchTool].
 
 ## Reasoning effort
 

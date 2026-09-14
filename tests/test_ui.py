@@ -305,6 +305,34 @@ async def test_event_stream_back_to_back_text():
     )
 
 
+async def test_event_stream_without_run_input():
+    """A `UIEventStream` encodes events on its own, with no run input to build it from.
+
+    Transports that carry native events out of band — a durable execution workflow, a queue, a
+    websocket fan-out — encode them where no HTTP request exists. See #6970.
+    """
+
+    async def event_generator():
+        yield PartStartEvent(index=0, part=TextPart(content='Hello'))
+        yield PartEndEvent(index=0, part=TextPart(content='Hello'))
+
+    event_stream = DummyUIEventStream[None, str]()
+    assert event_stream.run_input is None
+
+    events = [event async for event in event_stream.transform_stream(event_generator())]
+
+    assert events == snapshot(
+        [
+            '<stream>',
+            '<response>',
+            '<text follows_text=False>Hello',
+            '</text followed_by_text=False>',
+            '</response>',
+            '</stream>',
+        ]
+    )
+
+
 async def test_event_stream_close_finalizes_native_stream_without_protocol_trailer():
     """A disconnected consumer cannot receive protocol trailers, but its native stream must be closed."""
     finalized = anyio.Event()
@@ -818,7 +846,7 @@ async def test_run_stream_response_error():
             '<request>',
             "<function-tool-call name='unknown_tool'>None</function-tool-call>",
             "<function-tool-result name='unknown_tool'>Tool execution was interrupted by an error.</function-tool-result>",
-            "<error type='UnexpectedModelBehavior'>Tool 'unknown_tool' exceeded max retries count of 1. Consider raising the retry limit, or see the docs on tool retries: https://ai.pydantic.dev/tools-advanced/#tool-retries</error>",
+            "<error type='UnexpectedModelBehavior'>Tool 'unknown_tool' exceeded max retries count of 1. Consider raising the retry limit, or see the docs on tool retries: https://pydantic.dev/docs/ai/tools-toolsets/tools-advanced/#tool-retries</error>",
             '</request>',
             '</stream>',
         ]
@@ -857,6 +885,158 @@ async def test_run_stream_cancelled_run_closes_tools_as_interrupted():
             '</stream>',
         ]
     )
+
+
+class PartEndEventStream(UIEventStream[None, str | PartEndEvent, None, str]):
+    def encode_event(self, event: str | PartEndEvent) -> str:
+        return repr(event)  # pragma: no cover
+
+    async def before_stream(self) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+    async def after_stream(self) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+    async def before_response(self) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+    async def after_response(self) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+    async def handle_event(self, event: NativeEvent) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+    async def handle_part_end(self, event: PartEndEvent) -> AsyncIterator[str | PartEndEvent]:
+        yield event
+
+    async def on_cancelled(self, cancelled: RunCancelled) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+    async def on_error(self, error: Exception) -> AsyncIterator[str | PartEndEvent]:
+        return
+        yield
+
+
+@pytest.mark.parametrize(
+    ('part', 'deltas', 'expected_part'),
+    [
+        pytest.param(
+            TextPart(content='The'),
+            [TextPartDelta(content_delta=' quick brown fox'), TextPartDelta(content_delta=' jumps over')],
+            TextPart(content='The quick brown fox jumps over'),
+            id='text',
+        ),
+        pytest.param(
+            ThinkingPart(content='Looking'),
+            [ThinkingPartDelta(content_delta=' for an'), ThinkingPartDelta(content_delta=' answer')],
+            ThinkingPart(content='Looking for an answer'),
+            id='thinking',
+        ),
+        pytest.param(
+            ToolCallPart(tool_name='search', args=None, tool_call_id='call_1'),
+            [
+                ToolCallPartDelta(args_delta='{"query":', tool_call_id='call_1'),
+                ToolCallPartDelta(args_delta='"pydantic"}', tool_call_id='call_1'),
+            ],
+            ToolCallPart(tool_name='search', args='{"query":"pydantic"}', tool_call_id='call_1'),
+            id='tool-call',
+        ),
+        pytest.param(
+            NativeToolCallPart(tool_name='code_execution', args=None, tool_call_id='call_2'),
+            [
+                ToolCallPartDelta(args_delta='{"code":', tool_call_id='call_2'),
+                ToolCallPartDelta(args_delta='"print(1)"}', tool_call_id='call_2'),
+            ],
+            NativeToolCallPart(tool_name='code_execution', args='{"code":"print(1)"}', tool_call_id='call_2'),
+            id='native-tool-call',
+        ),
+    ],
+)
+async def test_cancelled_part_end_contains_accumulated_part(
+    part: TextPart | ThinkingPart | ToolCallPart | NativeToolCallPart,
+    deltas: list[TextPartDelta | ThinkingPartDelta | ToolCallPartDelta],
+    expected_part: TextPart | ThinkingPart | ToolCallPart | NativeToolCallPart,
+):
+    async def event_generator() -> AsyncIterator[NativeEvent]:
+        yield PartStartEvent(index=0, part=part)
+        for delta in deltas:
+            yield PartDeltaEvent(index=0, delta=delta)
+        raise RunCancelled('The agent run was cancelled.')
+
+    events = [event async for event in PartEndEventStream(run_input=None).transform_stream(event_generator())]
+
+    assert events == [PartEndEvent(index=0, part=expected_part)]
+
+
+async def test_cancelled_part_end_ignores_delta_for_different_part():
+    async def event_generator() -> AsyncIterator[NativeEvent]:
+        yield PartStartEvent(index=0, part=TextPart(content='Hello'))
+        yield PartDeltaEvent(index=1, delta=TextPartDelta(content_delta=' world'))
+        raise RunCancelled('The agent run was cancelled.')
+
+    events = [event async for event in PartEndEventStream().transform_stream(event_generator())]
+
+    assert events == [PartEndEvent(index=0, part=TextPart(content='Hello'))]
+
+
+@pytest.mark.parametrize(
+    ('yield_delta', 'expected_events'),
+    [
+        pytest.param(
+            True,
+            [' world', PartEndEvent(index=0, part=TextPart(content='Hello world'))],
+            id='after-yield',
+        ),
+        pytest.param(False, [PartEndEvent(index=0, part=TextPart(content='Hello'))], id='before-yield'),
+    ],
+)
+async def test_part_end_delta_matches_handler_output_on_error(
+    yield_delta: bool, expected_events: list[str | PartEndEvent]
+):
+    class FailingEventStream(PartEndEventStream):
+        async def handle_event(self, event: NativeEvent) -> AsyncIterator[str | PartEndEvent]:
+            if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                if yield_delta:
+                    yield event.delta.content_delta
+                raise RuntimeError('handler failed')
+
+    async def event_generator() -> AsyncIterator[NativeEvent]:
+        yield PartStartEvent(index=0, part=TextPart(content='Hello'))
+        yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' world'))
+
+    events = [event async for event in FailingEventStream().transform_stream(event_generator())]
+
+    assert events == expected_events
+
+
+async def test_part_cleanup_error_does_not_replace_stream_error():
+    class ErrorEventStream(PartEndEventStream):
+        async def on_error(self, error: Exception) -> AsyncIterator[str | PartEndEvent]:
+            yield f'{type(error).__name__}: {error}'
+
+    def raise_cleanup_error(_: dict[str, Any] | None) -> dict[str, Any]:
+        raise ValueError('cleanup failed')
+
+    async def event_generator() -> AsyncIterator[NativeEvent]:
+        yield PartStartEvent(index=0, part=ThinkingPart(content='Thinking'))
+        yield PartDeltaEvent(
+            index=0,
+            delta=ThinkingPartDelta(content_delta='...', provider_details=raise_cleanup_error),
+        )
+        raise RuntimeError('stream failed')
+
+    events = [event async for event in ErrorEventStream().transform_stream(event_generator())]
+
+    assert events == [
+        PartEndEvent(index=0, part=ThinkingPart(content='Thinking')),
+        'RuntimeError: stream failed',
+    ]
 
 
 async def test_run_stream_on_cancel():
@@ -1415,6 +1595,78 @@ async def test_reinject_system_prompt_capability_preserves_existing():
     assert [p.content for p in sys_parts] == ['First agent']
 
 
+async def test_adapter_server_mode_accepts_per_run_reinject_system_prompt():
+    """A caller may supply their own reinjector for the run without tripping over the adapter's.
+
+    Both land in the same run-supplied layer, where ids must be unique, so the adapter's own
+    instance has to stay out of the `reinject_system_prompt` slot the caller's default `id` takes.
+    """
+    agent = Agent(model=TestModel(), system_prompt='Server prompt')
+    adapter = DummyUIAdapter(agent, DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Hello')]))
+
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[SystemPromptPart(content='Stale prompt'), UserPromptPart(content='Earlier')]),
+        ModelResponse(parts=[TextPart(content='Earlier reply')]),
+    ]
+
+    events = [
+        event
+        async for event in adapter.run_stream_native(
+            message_history=history, capabilities=[ReinjectSystemPrompt(replace_existing=True)]
+        )
+    ]
+    run_result_event = next(event for event in events if isinstance(event, AgentRunResultEvent))
+
+    # The caller's reinjector does the work; the adapter must not add a colliding second one.
+    first_request = message(run_result_event.result.all_messages(), ModelRequest)
+    sys_parts = [p for p in first_request.parts if isinstance(p, SystemPromptPart)]
+    assert [p.content for p in sys_parts] == ['Server prompt']
+
+
+async def test_adapter_server_mode_with_non_replacing_agent_reinjector():
+    """Server mode stays authoritative when the agent carries a non-replacing reinjector.
+
+    A bare `ReinjectSystemPrompt()` leaves an existing `SystemPromptPart` alone, so if the adapter
+    let it stand in for its own, a stale prompt in the server-side history would win.
+    """
+    agent = Agent(model=TestModel(), system_prompt='Server prompt', capabilities=[ReinjectSystemPrompt()])
+    adapter = DummyUIAdapter(agent, DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Hello')]))
+
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[SystemPromptPart(content='Stale prompt'), UserPromptPart(content='Earlier')]),
+        ModelResponse(parts=[TextPart(content='Earlier reply')]),
+    ]
+
+    events = [event async for event in adapter.run_stream_native(message_history=history)]
+    run_result_event = next(event for event in events if isinstance(event, AgentRunResultEvent))
+
+    first_request = message(run_result_event.result.all_messages(), ModelRequest)
+    sys_parts = [p for p in first_request.parts if isinstance(p, SystemPromptPart)]
+    assert [p.content for p in sys_parts] == ['Server prompt']
+
+
+async def test_adapter_server_mode_with_deferred_agent_reinjector():
+    """Server mode stays authoritative when the agent's reinjector is deferred.
+
+    A deferred capability's `before_model_request` hook doesn't run until the model calls
+    `load_capability`, so it can never stand in for the adapter's own reinjector.
+    """
+    agent = Agent(
+        # `call_tools=[]` so the model doesn't call `load_capability`, leaving the reinjector deferred.
+        TestModel(call_tools=[]),
+        system_prompt='Server prompt',
+        capabilities=[ReinjectSystemPrompt(replace_existing=True, defer_loading=True, id='deferred_reinject')],
+    )
+    adapter = DummyUIAdapter(agent, DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Hello')]))
+
+    events = [event async for event in adapter.run_stream_native()]
+    run_result_event = next(event for event in events if isinstance(event, AgentRunResultEvent))
+
+    first_request = message(run_result_event.result.all_messages(), ModelRequest)
+    sys_parts = [p for p in first_request.parts if isinstance(p, SystemPromptPart)]
+    assert [p.content for p in sys_parts] == ['Server prompt']
+
+
 def test_allowed_file_url_schemes_visible_in_base_adapter_signatures():
     from_request_parameters = inspect.signature(DummyUIAdapter.from_request).parameters
     dispatch_request_parameters = inspect.signature(DummyUIAdapter.dispatch_request).parameters
@@ -1956,9 +2208,13 @@ def test_sanitize_messages_keeps_dangling_native_tool_calls():
         ]
     )
 
-    with warnings.catch_warnings():
-        warnings.simplefilter('error')  # no dangling-tool-call warning should fire for native calls
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        # Scoped to the warning these tests own rather than `simplefilter('error')`: that form
+        # overrode the suite's intentional `ResourceWarning` ignores, so delayed event-loop GC
+        # failed whichever test happened to collect it.
+        warnings.filterwarnings('always', message=r'Client-submitted history ended with unresolved tool call')
         sanitized = adapter.sanitize_messages(adapter.messages)
+    assert not caught_warnings
 
     response = message(sanitized, ModelResponse, index=1)
     assert [type(p).__name__ for p in response.parts] == ['TextPart', 'NativeToolCallPart']
