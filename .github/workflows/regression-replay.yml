@@ -1,0 +1,81 @@
+name: Regression Replay
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-replay-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    name: Pydantic AI streaming replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Run pass-fail-pass replay
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_case() {
+            local version="$1"
+            local expected_status="$2"
+            local expected_marker="$3"
+            local expected_detail="${4:-}"
+            local output_file
+            output_file=$(mktemp)
+
+            echo "::group::pydantic-ai-slim ${version}"
+            set +e
+            uv run --isolated --no-project --no-config \
+              --with "pydantic-ai-slim==${version}" \
+              python pydantic-ai-repro.py 2>&1 | tee "$output_file"
+            local status=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+
+            if [ "$status" -ne "$expected_status" ]; then
+              echo "Expected exit ${expected_status} for ${version}, received ${status}."
+              exit 1
+            fi
+
+            if ! grep -Fq "$expected_marker" "$output_file"; then
+              echo "Expected result marker was not present for ${version}: ${expected_marker}"
+              exit 1
+            fi
+
+            if [ -n "$expected_detail" ] && ! grep -Fq "$expected_detail" "$output_file"; then
+              echo "Expected failure detail was not present for ${version}: ${expected_detail}"
+              exit 1
+            fi
+          }
+
+          run_case "1.91.0" 0 "RESULT: PASS version=1.91.0"
+          run_case \
+            "1.92.0" \
+            1 \
+            "RESULT: FAIL version=1.92.0 mode=exception" \
+            "with_handler: RAISED UnexpectedModelBehavior"
+          run_case "1.106.0" 0 "RESULT: PASS version=1.106.0"
+
+      - name: Check repository text formatting
+        run: git diff --check HEAD^
